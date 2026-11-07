@@ -88,7 +88,3 @@ pytest tests -q
 ```
 
 The backend test covers create → resolve → retrieve → fallback analysis. The frontend can be production checked with `npm run build`.
-
-## Current limitations
-
-Gemini is configured as an environment-driven extension point, but this MVP always uses the retrieval fallback until a provider implementation/key is enabled. GitHub/deployment integration is intentionally not simulated; deployment claims are only stored when supplied. Service dependency topology, FTS5 and schema migration tooling are future extensions; the SQLite schema is initialized safely on startup.
