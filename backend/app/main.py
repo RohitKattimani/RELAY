@@ -17,6 +17,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 logger=logging.getLogger('relay.analysis')
 
 URL=os.getenv('DATABASE_URL','sqlite:///./data/relay.db')
+HINDSIGHT_URL=os.getenv('HINDSIGHT_URL','https://api.hindsight.vectorize.io').rstrip('/')
+HINDSIGHT_BANK=os.getenv('HINDSIGHT_BANK','relay-incidents')
 if URL.startswith('sqlite:///'): Path(URL.replace('sqlite:///','')).parent.mkdir(parents=True, exist_ok=True)
 engine=create_engine(URL, connect_args={'check_same_thread':False} if URL.startswith('sqlite') else {})
 SessionLocal=sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -60,6 +62,70 @@ def matches(s, incident, limit=5):
     for row,score in sorted(zip(rows,scores),key=lambda x:x[1],reverse=True)[:limit]: out.append({'incident':dump(row),'similarity':round(float(score),4)})
     return out
 def safe(text): return re.sub(r'(?i)(password|token|api[_-]?key|secret)\s*[=:]\s*\S+',r'\1=[REDACTED]',text or '')
+
+def hindsight_enabled():
+    return bool(os.getenv('HINDSIGHT_API_KEY'))
+
+def hindsight_client():
+    if not hindsight_enabled():
+        return None
+    return {'headers':{'Authorization':f"Bearer {os.environ['HINDSIGHT_API_KEY']}",'Content-Type':'application/json'}}
+
+def hindsight_recall(query):
+    client=hindsight_client()
+    if client is None:
+        return []
+    try:
+        response=httpx.post(
+            f'{HINDSIGHT_URL}/v1/default/banks/{HINDSIGHT_BANK}/memories/recall',
+            headers=client['headers'],
+            json={'query':query,'budget':'mid','max_tokens':1200},
+            timeout=15,
+        )
+        response.raise_for_status()
+        return [{'text':item.get('text',''),'type':item.get('type',''),'context':item.get('context',''),'metadata':item.get('metadata',{})} for item in response.json().get('results',[])]
+    except Exception:
+        logger.exception('Hindsight recall failed')
+        return []
+
+def hindsight_retain(incident):
+    client=hindsight_client()
+    if client is None:
+        return False
+    content=(
+        f'Incident {incident.incident_id}: {incident.title}\n'
+        f'Service: {incident.service}\nSeverity: {incident.severity}\n'
+        f'Description: {safe(incident.description)}\n'
+        f'Observed logs: {safe(incident.logs)}\n'
+        f'Root cause: {safe(incident.root_cause)}\n'
+        f'Resolution: {safe(incident.resolution_steps)}\n'
+        f'Lessons learned: {safe(incident.lessons_learned)}'
+    )
+    try:
+        bank_url=f'{HINDSIGHT_URL}/v1/default/banks/{HINDSIGHT_BANK}'
+        bank=httpx.put(
+            bank_url,
+            headers=client['headers'],
+            json={
+                'name':'Relay Incident Memory',
+                'mission':'Retain accurate, evidence-grounded incident response knowledge for Relay.',
+                'enable_observations':True,
+            },
+            timeout=15,
+        )
+        bank.raise_for_status()
+        response=httpx.post(
+            f'{bank_url}/memories',
+            headers=client['headers'],
+            json={'items':[{'content':content,'context':'resolved Relay incident','document_id':incident.incident_id,'metadata':{'service':incident.service,'severity':incident.severity,'source':'relay'}}]},
+            timeout=15,
+        )
+        response.raise_for_status()
+        return True
+    except Exception:
+        logger.exception('Hindsight retain failed for %s',incident.incident_id)
+        return False
+
 def gemini_analysis(context, fallback):
     key=os.getenv('GEMINI_API_KEY')
     provider=os.getenv('LLM_PROVIDER','gemini').lower()
@@ -96,13 +162,15 @@ Evidence context:
 
 def analyze(s,i):
     found=matches(s,i); runbooks=s.scalars(select(Runbook).where(or_(Runbook.services.contains(i.service),Runbook.description.contains(i.service))).limit(3)).all()
+    hindsight=hindsight_recall(f'{i.service} incident diagnosis, root cause, resolution, and lessons learned')
     evidence=[]
     if i.logs:evidence.append('Supplied logs: '+safe(i.logs)[:400])
     if found: evidence.append(f"Historical evidence: {found[0]['incident']['incident_id']} ({found[0]['similarity']:.0%} similarity) was resolved with a related procedure.")
+    if hindsight: evidence.append(f'Hindsight memory returned {len(hindsight)} relevant retained incident fact(s).')
     root=found[0]['incident']['root_cause'] if found and found[0]['similarity']>.08 else 'Unconfirmed — collect diagnostics before assigning a root cause.'
     steps=(found[0]['incident']['resolution_steps'] if found and found[0]['similarity']>.08 else '1. Confirm impact and inspect recent deployments.\n2. Correlate errors with service logs and dependencies.\n3. Apply only an approved, reversible mitigation.')
-    fallback={'mode':'fallback','summary':'Retrieval-based fallback analysis; no configured or valid LLM response was used.','likely_root_causes':[{'cause':root,'confidence':'hypothesis','reasoning':'Based on computed historical similarity and supplied evidence.'}], 'supporting_evidence':evidence,'historical_incidents':found,'recommended_diagnostics':['Review recent deployment context','Check service and dependency errors','Capture metrics before mitigation'],'recommended_resolution_steps':steps.split('\n'),'risk_level':'medium','verification_procedure':'Verify error rate and latency return to baseline; document observed evidence.','rollback_considerations':'Use the relevant runbook rollback procedure; do not make automatic changes.','uncertainties':['This is advisory analysis. Root cause remains unconfirmed until human review.'],'runbooks':[{'id':r.id,'title':r.title,'steps':r.steps} for r in runbooks]}
-    context={'incident':{'title':i.title,'description':safe(i.description),'service':i.service,'severity':i.severity,'logs':safe(i.logs),'deployment':i.deployment_ref},'historical':[{'id':x['incident']['incident_id'],'root_cause':x['incident']['root_cause'],'resolution':x['incident']['resolution_steps'],'similarity':x['similarity']} for x in found],'runbooks':[{'title':r.title,'steps':r.steps} for r in runbooks]}
+    fallback={'mode':'fallback','summary':'Retrieval-based fallback analysis; no configured or valid LLM response was used.','likely_root_causes':[{'cause':root,'confidence':'hypothesis','reasoning':'Based on computed historical similarity and supplied evidence.'}], 'supporting_evidence':evidence,'historical_incidents':found,'hindsight_memories':hindsight,'recommended_diagnostics':['Review recent deployment context','Check service and dependency errors','Capture metrics before mitigation'],'recommended_resolution_steps':steps.split('\n'),'risk_level':'medium','verification_procedure':'Verify error rate and latency return to baseline; document observed evidence.','rollback_considerations':'Use the relevant runbook rollback procedure; do not make automatic changes.','uncertainties':['This is advisory analysis. Root cause remains unconfirmed until human review.'],'runbooks':[{'id':r.id,'title':r.title,'steps':r.steps} for r in runbooks]}
+    context={'incident':{'title':i.title,'description':safe(i.description),'service':i.service,'severity':i.severity,'logs':safe(i.logs),'deployment':i.deployment_ref},'historical':[{'id':x['incident']['incident_id'],'root_cause':x['incident']['root_cause'],'resolution':x['incident']['resolution_steps'],'similarity':x['similarity']} for x in found],'hindsight_memories':hindsight,'runbooks':[{'title':r.title,'steps':r.steps} for r in runbooks]}
     parsed=gemini_analysis(context,fallback)
     if parsed is fallback: return fallback
     fallback.update(parsed);fallback['mode']='gemini';fallback['summary']='Gemini-assisted analysis. Confirm all hypotheses through human review. '+parsed['summary'];return fallback
@@ -140,7 +208,7 @@ def seed(s):
  for title,desc,services,steps in [('Database connection pool exhaustion','Diagnose database connection saturation.','checkout-api','Check pool utilization. Compare latest deploy. Tune only after approval.'),('Elevated API latency','Trace latency through dependencies.','checkout-api,payment-gateway','Check error rate, traces, database latency, then apply reversible mitigation.'),('Deployment regression','Safely assess a problematic release.','event-worker,checkout-api','Compare release, pause rollout, use verified rollback if approved.'),('Queue backlog','Restore worker throughput.','event-worker','Check queue age, consumer errors, throughput and retry rate.')]: s.add(Runbook(title=title,description=desc,services=services,steps=steps,is_sample=True))
  s.add(Activity(kind='seed',message='Sample demonstration data initialized.'));s.commit()
 @app.get('/api/v1/health')
-def health(): return {'status':'ok','llm_configured':bool(os.getenv('GEMINI_API_KEY')),'time':now()}
+def health(): return {'status':'ok','llm_configured':bool(os.getenv('GEMINI_API_KEY')),'hindsight_configured':hindsight_enabled(),'time':now()}
 @app.get('/api/v1/incidents')
 def list_incidents(status:Optional[str]=None,severity:Optional[str]=None,service:Optional[str]=None,q:Optional[str]=None,s:Session=Depends(db)):
  st=select(Incident)
@@ -172,7 +240,7 @@ def analysis(id:int,s:Session=Depends(db)):
 def resolve(id:int,x:Resolve,s:Session=Depends(db)):
  i=s.get(Incident,id)
  if not i:raise HTTPException(404,'Incident not found')
- i.status='Resolved';i.root_cause=x.root_cause;i.resolution_steps=x.resolution_steps;i.lessons_learned=x.lessons_learned;i.resolved_at=now();s.add(Feedback(incident_id=i.id,helpful=x.helpful,comment=x.feedback));s.add(Activity(kind='resolution',message=f'Incident {i.incident_id} resolved and saved to memory.',incident_id=i.id));s.commit();return dump(i)
+ i.status='Resolved';i.root_cause=x.root_cause;i.resolution_steps=x.resolution_steps;i.lessons_learned=x.lessons_learned;i.resolved_at=now();s.add(Feedback(incident_id=i.id,helpful=x.helpful,comment=x.feedback));s.add(Activity(kind='resolution',message=f'Incident {i.incident_id} resolved and saved to memory.',incident_id=i.id));s.commit();hindsight_retain(i);return dump(i)
 @app.post('/api/v1/incidents/{id}/reopen')
 def reopen(id:int,s:Session=Depends(db)):
  i=s.get(Incident,id)

@@ -6,7 +6,7 @@ Relay is a local, AI-assisted incident response workspace. It stores incidents, 
 
 - **Frontend:** React + Vite, with the original Relay visual language and a fetch API client.
 - **Backend:** FastAPI + SQLAlchemy + SQLite at `backend/app/main.py`.
-- **Memory:** resolved incident text is persisted and ranked with scikit-learn TF-IDF/cosine similarity.
+- **Memory:** resolved incident text is persisted and ranked locally with scikit-learn TF-IDF/cosine similarity; Hindsight can retain and recall the same evidence server-side.
 - **LLM:** Gemini configuration is reserved via environment variables; the no-key fallback is safe and deterministic. Logs are sanitized before analysis.
 
 ## Features
@@ -50,7 +50,10 @@ Copy `backend/.env.example` to `backend/.env` (and load it in your shell or proc
 - `SEED_SAMPLE_DATA=true`
 - `CORS_ORIGINS=http://localhost:5173`
 - `GEMINI_API_KEY=` and `GEMINI_MODEL=` for future Gemini-backed analysis
+- `HINDSIGHT_URL=https://api.hindsight.vectorize.io`, `HINDSIGHT_API_KEY=`, and `HINDSIGHT_BANK=relay-incidents` for backend-only incident memory
 - `VITE_API_BASE_URL=http://localhost:8000/api/v1` (optional frontend setting)
+
+Hindsight is accessed only by the FastAPI backend. When configured, resolved incidents are retained in the configured bank and analysis recalls relevant retained facts. The React frontend does not receive or store the Hindsight key.
 
 The database initializes and seeds only when empty. User records survive restarts. To reset demo data in development, stop the backend and delete only `backend/data/relay.db` after backing up any wanted user data.
 
